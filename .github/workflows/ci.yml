@@ -1,0 +1,22 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+# Даем права процессу сборки на чтение кода и запись готового Docker-образа
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    # Вызываем наш центральный шаблон из инфраструктурной репы
+    uses: inventory-proj/inv-infra/.github/workflows/docker-build-template.yml@main
+    with:
+      image_name: "inv-backend"
+      context_dir: "."
+    secrets:
+      REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
