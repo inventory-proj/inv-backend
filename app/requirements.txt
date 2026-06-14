@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+psycopg2-binary
+pydantic
+passlib
+bcrypt==3.2.2
+PyJWT
