@@ -66,6 +66,9 @@ class ServerCreate(BaseModel):
 class ServerMove(BaseModel):
     target_workspace_id: int
 
+class ServerRename(BaseModel):
+    hostname: str
+
 class InviteData(BaseModel):
     username: str
     workspace_id: int
@@ -128,7 +131,6 @@ def register_user(user_data: UserCreate):
             )
             new_user_id = cur.fetchone()['id']
             
-            # Создаем первую группу по имени юзера
             ws_name = f"Группа - {user_data.username}"
             cur.execute(
                 "INSERT INTO workspaces (name, owner_id) VALUES (%s, %s) RETURNING id",
@@ -150,9 +152,7 @@ def register_user(user_data: UserCreate):
 # --- CORE: ЭНДПОИНТ ДАШБОРДА ---
 @app.get("/api/dashboard")
 def get_dashboard(current_user: dict = Depends(get_current_user)):
-    """Возвращает все группы юзера, их серверы и участников за один запрос"""
     with get_db_cursor() as cur:
-        # 1. Получаем все группы, где юзер состоит
         cur.execute("""
             SELECT w.id, w.name, w.owner_id 
             FROM workspaces w
@@ -162,11 +162,9 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
         """, (current_user['user_id'],))
         workspaces = cur.fetchall()
 
-        # 2. Наполняем группы данными
         for ws in workspaces:
             ws['is_owner'] = (ws['owner_id'] == current_user['user_id'])
             
-            # Серверы группы
             cur.execute("""
                 SELECT id, hostname, ip_address, status, agent_token 
                 FROM servers 
@@ -175,7 +173,6 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
             """, (ws['id'],))
             ws['servers'] = cur.fetchall()
             
-            # Участники группы
             cur.execute("""
                 SELECT u.username, u.email 
                 FROM workspace_members wm
@@ -214,9 +211,7 @@ def delete_workspace(ws_id: int, current_user: dict = Depends(get_current_user))
 @app.post("/api/team/invite")
 def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_user)):
     clean_username = data.username.strip('@')
-    
     with get_db_cursor(commit=True) as cur:
-        # Проверяем, что юзер - владелец именно ЭТОЙ группы
         cur.execute("SELECT owner_id FROM workspaces WHERE id = %s", (data.workspace_id,))
         ws = cur.fetchone()
         if not ws or ws['owner_id'] != current_user['user_id']:
@@ -245,7 +240,6 @@ def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_us
 @app.post("/api/servers")
 def create_server(server: ServerCreate, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        # Проверяем, состоит ли юзер в этой группе (добавлять могут все участники)
         cur.execute("SELECT 1 FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (server.workspace_id, current_user['user_id']))
         if not cur.fetchone():
             raise HTTPException(status_code=403, detail="У вас нет доступа к этой группе")
@@ -266,24 +260,31 @@ def create_server(server: ServerCreate, current_user: dict = Depends(get_current
         "install_command": f"curl -sL https://inv.e-laba52.ru/agent.sh | sudo bash -s -- --token={new_server['agent_token']}"
     }
 
-@app.delete("/api/servers/{server_id}")
-def archive_server(server_id: int, current_user: dict = Depends(get_current_user)):
+@app.put("/api/servers/{server_id}/rename")
+def rename_server(server_id: int, data: ServerRename, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
         verify_server_access(cur, server_id, current_user['user_id'])
-        cur.execute("UPDATE servers SET status = 'archived' WHERE id = %s;", (server_id,))
+        try:
+            cur.execute("UPDATE servers SET hostname = %s WHERE id = %s", (data.hostname, server_id))
+        except psycopg2.IntegrityError:
+            raise HTTPException(status_code=400, detail="Имя уже занято в этой группе")
     return {"status": "ok"}
 
 @app.put("/api/servers/{server_id}/move")
 def move_server(server_id: int, data: ServerMove, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        # 1. Проверяем доступ к текущему серверу
         verify_server_access(cur, server_id, current_user['user_id'])
-        # 2. Проверяем доступ к целевой группе
         cur.execute("SELECT 1 FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (data.target_workspace_id, current_user['user_id']))
         if not cur.fetchone():
             raise HTTPException(status_code=403, detail="У вас нет доступа к целевой группе")
-        
         cur.execute("UPDATE servers SET workspace_id = %s WHERE id = %s", (data.target_workspace_id, server_id))
+    return {"status": "ok"}
+
+@app.delete("/api/servers/{server_id}")
+def archive_server(server_id: int, current_user: dict = Depends(get_current_user)):
+    with get_db_cursor(commit=True) as cur:
+        verify_server_access(cur, server_id, current_user['user_id'])
+        cur.execute("UPDATE servers SET status = 'archived' WHERE id = %s;", (server_id,))
     return {"status": "ok"}
 
 @app.get("/api/export")
