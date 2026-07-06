@@ -1,6 +1,8 @@
 import os
 import json
 import re
+import urllib.request
+import urllib.parse
 from fastapi import FastAPI, Query, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -211,7 +213,6 @@ def delete_workspace(ws_id: int, current_user: dict = Depends(get_current_user))
 @app.delete("/api/workspaces/{ws_id}/leave")
 def leave_workspace(ws_id: int, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        # Проверяем, не владелец ли это
         cur.execute("SELECT owner_id FROM workspaces WHERE id = %s", (ws_id,))
         ws = cur.fetchone()
         if not ws:
@@ -287,10 +288,22 @@ def rename_server(server_id: int, data: ServerRename, current_user: dict = Depen
 @app.put("/api/servers/{server_id}/move")
 def move_server(server_id: int, data: ServerMove, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        verify_server_access(cur, server_id, current_user['user_id'])
+        cur.execute("""
+            SELECT w.owner_id FROM servers s
+            JOIN workspaces w ON s.workspace_id = w.id
+            WHERE s.id = %s
+        """, (server_id,))
+        ws = cur.fetchone()
+        
+        if not ws:
+            raise HTTPException(status_code=404, detail="Сервер не найден")
+        if ws['owner_id'] != current_user['user_id']:
+            raise HTTPException(status_code=403, detail="Только создатель группы может перемещать её серверы")
+
         cur.execute("SELECT 1 FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (data.target_workspace_id, current_user['user_id']))
         if not cur.fetchone():
             raise HTTPException(status_code=403, detail="У вас нет доступа к целевой группе")
+            
         cur.execute("UPDATE servers SET workspace_id = %s WHERE id = %s", (data.target_workspace_id, server_id))
     return {"status": "ok"}
 
@@ -300,6 +313,46 @@ def archive_server(server_id: int, current_user: dict = Depends(get_current_user
         verify_server_access(cur, server_id, current_user['user_id'])
         cur.execute("UPDATE servers SET status = 'archived' WHERE id = %s;", (server_id,))
     return {"status": "ok"}
+
+# --- ЭНДПОИНТ ДЛЯ ПОЛУЧЕНИЯ ЛОГОВ (ПРОКСИ В LOKI) ---
+@app.get("/api/servers/{server_id}/logs")
+def get_server_logs(server_id: int, job: str = "varlogs", limit: int = 150, current_user: dict = Depends(get_current_user)):
+    with get_db_cursor() as cur:
+        verify_server_access(cur, server_id, current_user['user_id'])
+        cur.execute("SELECT agent_token FROM servers WHERE id = %s", (server_id,))
+        server = cur.fetchone()
+
+    if not server or not server['agent_token']:
+        raise HTTPException(status_code=404, detail="Агент не инициализирован")
+
+    token = str(server['agent_token'])
+    
+    # Формируем запрос к Loki (внутренний адрес в Kubernetes)
+    query = f'{{job="{job}"}}'
+    encoded_query = urllib.parse.quote(query)
+    loki_url = f"http://loki-service:3100/loki/api/v1/query?query={encoded_query}&limit={limit}"
+    
+    req = urllib.request.Request(loki_url)
+    # КЛЮЧЕВОЙ МОМЕНТ: Передаем токен как OrgID, чтобы Loki понял, чьи логи мы просим
+    req.add_header("X-Scope-OrgID", token)
+    
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode())
+            logs = []
+            if data.get("status") == "success":
+                result = data.get("data", {}).get("result", [])
+                for stream in result:
+                    for val in stream.get("values", []):
+                        # val = [timestamp_string, log_line_string]
+                        logs.append({"ts": val[0], "line": val[1]})
+            
+            # Сортируем логи от старых к новым для правильного отображения в терминале
+            logs.sort(key=lambda x: x["ts"])
+            return {"status": "ok", "logs": logs}
+    except Exception as e:
+        print(f"Loki fetch error: {e}")
+        return {"status": "error", "logs": [], "detail": "Логи временно недоступны или еще не поступили"}
 
 @app.get("/api/export")
 def export_database(current_user: dict = Depends(require_global_admin)):
