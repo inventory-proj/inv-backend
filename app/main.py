@@ -208,6 +208,20 @@ def delete_workspace(ws_id: int, current_user: dict = Depends(get_current_user))
             raise HTTPException(status_code=403, detail="Только владелец может удалить группу")
     return {"status": "ok"}
 
+@app.delete("/api/workspaces/{ws_id}/leave")
+def leave_workspace(ws_id: int, current_user: dict = Depends(get_current_user)):
+    with get_db_cursor(commit=True) as cur:
+        # Проверяем, не владелец ли это
+        cur.execute("SELECT owner_id FROM workspaces WHERE id = %s", (ws_id,))
+        ws = cur.fetchone()
+        if not ws:
+            raise HTTPException(status_code=404, detail="Группа не найдена")
+        if ws['owner_id'] == current_user['user_id']:
+            raise HTTPException(status_code=400, detail="Владелец не может покинуть группу. Вы можете только удалить её.")
+            
+        cur.execute("DELETE FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (ws_id, current_user['user_id']))
+    return {"status": "ok"}
+
 @app.post("/api/team/invite")
 def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_user)):
     clean_username = data.username.strip('@')
