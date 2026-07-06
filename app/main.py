@@ -63,6 +63,9 @@ class ServerCreate(BaseModel):
     workspace_id: int
     cluster_id: int | None = None
 
+class ServerMove(BaseModel):
+    target_workspace_id: int
+
 class InviteData(BaseModel):
     username: str
     workspace_id: int
@@ -192,6 +195,22 @@ def create_workspace(data: WorkspaceCreate, current_user: dict = Depends(get_cur
         cur.execute("INSERT INTO workspace_members (workspace_id, user_id) VALUES (%s, %s)", (ws_id, current_user['user_id']))
     return {"status": "ok"}
 
+@app.put("/api/workspaces/{ws_id}")
+def rename_workspace(ws_id: int, data: WorkspaceCreate, current_user: dict = Depends(get_current_user)):
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("UPDATE workspaces SET name = %s WHERE id = %s AND owner_id = %s RETURNING id", (data.name, ws_id, current_user['user_id']))
+        if not cur.fetchone():
+            raise HTTPException(status_code=403, detail="Только владелец может переименовать группу")
+    return {"status": "ok"}
+
+@app.delete("/api/workspaces/{ws_id}")
+def delete_workspace(ws_id: int, current_user: dict = Depends(get_current_user)):
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("DELETE FROM workspaces WHERE id = %s AND owner_id = %s RETURNING id", (ws_id, current_user['user_id']))
+        if not cur.fetchone():
+            raise HTTPException(status_code=403, detail="Только владелец может удалить группу")
+    return {"status": "ok"}
+
 @app.post("/api/team/invite")
 def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_user)):
     clean_username = data.username.strip('@')
@@ -252,6 +271,19 @@ def archive_server(server_id: int, current_user: dict = Depends(get_current_user
     with get_db_cursor(commit=True) as cur:
         verify_server_access(cur, server_id, current_user['user_id'])
         cur.execute("UPDATE servers SET status = 'archived' WHERE id = %s;", (server_id,))
+    return {"status": "ok"}
+
+@app.put("/api/servers/{server_id}/move")
+def move_server(server_id: int, data: ServerMove, current_user: dict = Depends(get_current_user)):
+    with get_db_cursor(commit=True) as cur:
+        # 1. Проверяем доступ к текущему серверу
+        verify_server_access(cur, server_id, current_user['user_id'])
+        # 2. Проверяем доступ к целевой группе
+        cur.execute("SELECT 1 FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (data.target_workspace_id, current_user['user_id']))
+        if not cur.fetchone():
+            raise HTTPException(status_code=403, detail="У вас нет доступа к целевой группе")
+        
+        cur.execute("UPDATE servers SET workspace_id = %s WHERE id = %s", (data.target_workspace_id, server_id))
     return {"status": "ok"}
 
 @app.get("/api/export")
