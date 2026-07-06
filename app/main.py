@@ -1,9 +1,10 @@
 import os
 import json
+import re
 from fastapi import FastAPI, Query, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import jwt
@@ -45,11 +46,13 @@ def get_db_cursor(commit=False):
 
 # --- СХЕМЫ ---
 class LoginData(BaseModel):
-    email: str
+    email: EmailStr
     password: str
 
 class UserCreate(BaseModel):
-    email: str
+    # Жесткая валидация: только буквы, цифры, _, от 3 до 30 символов
+    username: str = Field(..., pattern=r'^[a-zA-Z0-9_]{3,30}$')
+    email: EmailStr
     password: str
 
 class ServerCreate(BaseModel):
@@ -58,7 +61,7 @@ class ServerCreate(BaseModel):
     cluster_id: int | None = None
 
 class InviteData(BaseModel):
-    email: str
+    username: str
 
 # --- АВТОРИЗАЦИЯ ---
 def get_current_user(request: Request):
@@ -90,7 +93,7 @@ def verify_server_access(cur, server_id: int, user_id: int):
 def login(data: LoginData):
     with get_db_cursor() as cur:
         cur.execute("""
-            SELECT u.id, u.email, u.password_hash, r.role_name 
+            SELECT u.id, u.username, u.email, u.password_hash, r.role_name 
             FROM users u JOIN roles r ON u.role_id = r.id 
             WHERE u.email = %s
         """, (data.email,))
@@ -98,10 +101,20 @@ def login(data: LoginData):
 
     if user and pwd_context.verify(data.password, user['password_hash']):
         token = jwt.encode(
-            {"user_id": user['id'], "email": user['email'], "role": user['role_name']}, 
+            {
+                "user_id": user['id'], 
+                "username": user['username'], 
+                "email": user['email'], 
+                "role": user['role_name']
+            }, 
             SECRET_KEY, algorithm="HS256"
         )
-        return {"token": token, "role": user['role_name'], "email": user['email']}
+        return {
+            "token": token, 
+            "role": user['role_name'], 
+            "email": user['email'], 
+            "username": user['username']
+        }
     raise HTTPException(status_code=401, detail="Неверная почта или пароль")
 
 @app.post("/api/users")
@@ -113,8 +126,8 @@ def register_user(user_data: UserCreate):
             role = cur.fetchone()
             
             cur.execute(
-                "INSERT INTO users (email, password_hash, role_id) VALUES (%s, %s, %s) RETURNING id",
-                (user_data.email, hashed_pwd, role['id'])
+                "INSERT INTO users (username, email, password_hash, role_id) VALUES (%s, %s, %s, %s) RETURNING id",
+                (user_data.username, user_data.email, hashed_pwd, role['id'])
             )
             new_user_id = cur.fetchone()['id']
             
@@ -130,13 +143,16 @@ def register_user(user_data: UserCreate):
                 (new_workspace_id, new_user_id)
             )
         return {"status": "ok"}
-    except psycopg2.IntegrityError:
+    except psycopg2.IntegrityError as e:
+        error_msg = str(e)
+        if 'users_username_key' in error_msg:
+            raise HTTPException(status_code=400, detail="Этот никнейм уже занят")
         raise HTTPException(status_code=400, detail="Эта почта уже зарегистрирована")
 
 # --- ЭНДПОИНТЫ КОМАНДЫ ---
 @app.get("/api/team")
 def get_team(current_user: dict = Depends(get_current_user)):
-    """Получить список коллег в своей личной группе"""
+    """Получить список коллег"""
     with get_db_cursor() as cur:
         cur.execute("SELECT id FROM workspaces WHERE owner_id = %s LIMIT 1", (current_user['user_id'],))
         ws = cur.fetchone()
@@ -144,7 +160,7 @@ def get_team(current_user: dict = Depends(get_current_user)):
             return []
         
         cur.execute("""
-            SELECT u.id, u.email 
+            SELECT u.id, u.username, u.email 
             FROM workspace_members wm
             JOIN users u ON wm.user_id = u.id
             WHERE wm.workspace_id = %s
@@ -153,19 +169,201 @@ def get_team(current_user: dict = Depends(get_current_user)):
 
 @app.post("/api/team/invite")
 def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_user)):
-    """Добавить существующего юзера в свою группу по email"""
+    """Добавить по @никнейму"""
+    # Очищаем от @ если юзер случайно ввел с собачкой
+    clean_username = data.username.strip('@')
+    
     with get_db_cursor(commit=True) as cur:
-        # Ищем личную группу текущего юзера
         cur.execute("SELECT id FROM workspaces WHERE owner_id = %s LIMIT 1", (current_user['user_id'],))
         ws = cur.fetchone()
         if not ws:
             raise HTTPException(status_code=403, detail="Только владелец может приглашать коллег")
 
-        # Ищем приглашаемого юзера
-        cur.execute("SELECT id FROM users WHERE email = %s", (data.email,))
+        cur.execute("SELECT id, username FROM users WHERE username = %s", (clean_username,))import os
+import json
+import re
+from fastapi import FastAPI, Query, HTTPException, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from pydantic import BaseModel, EmailStr, Field
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import jwt
+from passlib.context import CryptContext
+from contextlib import contextmanager
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DB_USER = os.getenv("POSTGRES_USER", "administrator")
+DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
+DB_NAME = os.getenv("POSTGRES_DB", "inventory")
+DB_HOST = os.getenv("DB_HOST", "db")
+SECRET_KEY = os.getenv("SECRET_KEY", "fallback_secret_for_local_dev")
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+@contextmanager
+def get_db_cursor(commit=False):
+    conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST)
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        yield cur
+        if commit:
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cur.close()
+        conn.close()
+
+# --- СХЕМЫ ---
+class LoginData(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserCreate(BaseModel):
+    # Жесткая валидация: только буквы, цифры, _, от 3 до 30 символов
+    username: str = Field(..., pattern=r'^[a-zA-Z0-9_]{3,30}$')
+    email: EmailStr
+    password: str
+
+class ServerCreate(BaseModel):
+    hostname: str
+    ip_address: str
+    cluster_id: int | None = None
+
+class InviteData(BaseModel):
+    username: str
+
+# --- АВТОРИЗАЦИЯ ---
+def get_current_user(request: Request):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+    token = auth_header.split(" ")[1]
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Неверный или просроченный токен")
+
+def require_global_admin(user: dict = Depends(get_current_user)):
+    if user.get("role") != "global_admin":
+        raise HTTPException(status_code=403, detail="Доступ только для администраторов")
+    return user
+
+def verify_server_access(cur, server_id: int, user_id: int):
+    cur.execute("""
+        SELECT s.workspace_id FROM servers s
+        JOIN workspace_members wm ON s.workspace_id = wm.workspace_id
+        WHERE s.id = %s AND wm.user_id = %s
+    """, (server_id, user_id))
+    if not cur.fetchone():
+        raise HTTPException(status_code=403, detail="У вас нет доступа к этому серверу")
+
+# --- ЭНДПОИНТЫ АВТОРИЗАЦИИ ---
+@app.post("/api/login")
+def login(data: LoginData):
+    with get_db_cursor() as cur:
+        cur.execute("""
+            SELECT u.id, u.username, u.email, u.password_hash, r.role_name 
+            FROM users u JOIN roles r ON u.role_id = r.id 
+            WHERE u.email = %s
+        """, (data.email,))
+        user = cur.fetchone()
+
+    if user and pwd_context.verify(data.password, user['password_hash']):
+        token = jwt.encode(
+            {
+                "user_id": user['id'], 
+                "username": user['username'], 
+                "email": user['email'], 
+                "role": user['role_name']
+            }, 
+            SECRET_KEY, algorithm="HS256"
+        )
+        return {
+            "token": token, 
+            "role": user['role_name'], 
+            "email": user['email'], 
+            "username": user['username']
+        }
+    raise HTTPException(status_code=401, detail="Неверная почта или пароль")
+
+@app.post("/api/users")
+def register_user(user_data: UserCreate):
+    hashed_pwd = pwd_context.hash(user_data.password)
+    try:
+        with get_db_cursor(commit=True) as cur:
+            cur.execute("SELECT id FROM roles WHERE role_name = 'tenant_admin'")
+            role = cur.fetchone()
+            
+            cur.execute(
+                "INSERT INTO users (username, email, password_hash, role_id) VALUES (%s, %s, %s, %s) RETURNING id",
+                (user_data.username, user_data.email, hashed_pwd, role['id'])
+            )
+            new_user_id = cur.fetchone()['id']
+            
+            # Создаем невидимую личную группу
+            cur.execute(
+                "INSERT INTO workspaces (name, owner_id) VALUES (%s, %s) RETURNING id",
+                ("Personal", new_user_id)
+            )
+            new_workspace_id = cur.fetchone()['id']
+            
+            cur.execute(
+                "INSERT INTO workspace_members (workspace_id, user_id) VALUES (%s, %s)",
+                (new_workspace_id, new_user_id)
+            )
+        return {"status": "ok"}
+    except psycopg2.IntegrityError as e:
+        error_msg = str(e)
+        if 'users_username_key' in error_msg:
+            raise HTTPException(status_code=400, detail="Этот никнейм уже занят")
+        raise HTTPException(status_code=400, detail="Эта почта уже зарегистрирована")
+
+# --- ЭНДПОИНТЫ КОМАНДЫ ---
+@app.get("/api/team")
+def get_team(current_user: dict = Depends(get_current_user)):
+    """Получить список коллег"""
+    with get_db_cursor() as cur:
+        cur.execute("SELECT id FROM workspaces WHERE owner_id = %s LIMIT 1", (current_user['user_id'],))
+        ws = cur.fetchone()
+        if not ws:
+            return []
+        
+        cur.execute("""
+            SELECT u.id, u.username, u.email 
+            FROM workspace_members wm
+            JOIN users u ON wm.user_id = u.id
+            WHERE wm.workspace_id = %s
+        """, (ws['id'],))
+        return cur.fetchall()
+
+@app.post("/api/team/invite")
+def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_user)):
+    """Добавить по @никнейму"""
+    # Очищаем от @ если юзер случайно ввел с собачкой
+    clean_username = data.username.strip('@')
+    
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("SELECT id FROM workspaces WHERE owner_id = %s LIMIT 1", (current_user['user_id'],))
+        ws = cur.fetchone()
+        if not ws:
+            raise HTTPException(status_code=403, detail="Только владелец может приглашать коллег")
+
+        cur.execute("SELECT id, username FROM users WHERE username = %s", (clean_username,))
         target_user = cur.fetchone()
         if not target_user:
-            raise HTTPException(status_code=404, detail="Пользователь с такой почтой не найден в системе")
+            raise HTTPException(status_code=404, detail="Пользователь с таким никнеймом не найден")
         
         if target_user['id'] == current_user['user_id']:
             raise HTTPException(status_code=400, detail="Нельзя пригласить самого себя")
@@ -178,23 +376,119 @@ def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_us
         except psycopg2.IntegrityError:
             raise HTTPException(status_code=400, detail="Этот пользователь уже в вашей команде")
             
-    return {"status": "ok", "message": "Пользователь добавлен в команду!"}
+    invite_link = f"https://inv.e-laba52.ru/?team_invite={ws['id']}"
+    return {
+        "status": "ok", 
+        "message": f"Пользователь @{target_user['username']} добавлен!",
+        "invite_link": invite_link
+    }
 
 # --- ЭНДПОИНТЫ СЕРВЕРОВ ---
 @app.post("/api/servers")
 def create_server(server: ServerCreate, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        # Сервер всегда добавляется в личную группу юзера
         cur.execute("SELECT id FROM workspaces WHERE owner_id = %s LIMIT 1", (current_user['user_id'],))
         ws = cur.fetchone()
         if not ws:
-            raise HTTPException(status_code=403, detail="У вас нет рабочего пространства для добавления серверов")
+            raise HTTPException(status_code=403, detail="У вас нет рабочего пространства")
         
         try:
             cur.execute("""
                 INSERT INTO servers (hostname, ip_address, cluster_id, workspace_id) 
                 VALUES (%s, %s, %s, %s) 
-                RETURNING id, agent_token
+                RETURNING id, agentgit add app/main.py && git commit -m "feat: handle username invites and validation" && git push origin main
+
+# В папке inv-frontend_token
+            """, (server.hostname, server.ip_address, server.cluster_id, ws['id']))
+            new_server = cur.fetchone()
+        except psycopg2.IntegrityError:
+            raise HTTPException(status_code=400, detail="Сервер с таким именем уже есть")
+            
+    return {
+        "status": "ok", 
+        "agent_token": new_server['agent_token'],
+        "install_command": f"curl -sL https://inv.e-laba52.ru/agent.sh | sudo bash -s -- --token={new_server['agent_token']}"
+    }
+
+@app.get("/api/servers")
+def get_servers(current_user: dict = Depends(get_current_user)):
+    with get_db_cursor() as cur:
+        cur.execute("""
+            SELECT s.id, s.hostname, s.ip_address, s.status, s.agent_token 
+            FROM servers s 
+            JOIN workspace_members wm ON s.workspace_id = wm.workspace_id
+            WHERE wm.user_id = %s
+            ORDER BY s.id ASC
+        """, (current_user['user_id'],))
+        servers = cur.fetchall()
+    return servers
+
+@app.delete("/api/servers/{server_id}")
+def archive_server(server_id: int, current_user: dict = Depends(get_current_user)):
+    with get_db_cursor(commit=True) as cur:
+        verify_server_access(cur, server_id, current_user['user_id'])
+        cur.execute("UPDATE servers SET status = 'archived' WHERE id = %s;", (server_id,))
+    return {"status": "ok"}
+
+@app.put("/api/servers/{server_id}/restore")
+def restore_server(server_id: int, current_user: dict = Depends(get_current_user)):
+    with get_db_cursor(commit=True) as cur:
+        verify_server_access(cur, server_id, current_user['user_id'])
+        cur.execute("UPDATE servers SET status = 'active' WHERE id = %s;", (server_id,))
+    return {"status": "ok"}
+
+@app.put("/api/servers/{server_id}/maintenance")
+def maintenance_server(server_id: int, current_user: dict = Depends(get_current_user)):
+    with get_db_cursor(commit=True) as cur:
+        verify_server_access(cur, server_id, current_user['user_id'])
+        cur.execute("CALL enable_maintenance(%s);", (server_id,))
+    return {"status": "ok"}
+
+@app.get("/api/export")
+def export_database(current_user: dict = Depends(require_global_admin)):
+    with get_db_cursor() as cur:
+        cur.execute("SELECT id, hostname, ip_address, status FROM servers")
+        servers = cur.fetchall()
+    json_str = json.dumps({"servers": servers}, indent=4, ensure_ascii=False)
+    return Response(content=json_str, media_type="application/json", headers={"Content-Disposition": "attachment; filename=backup.json"})
+        target_user = cur.fetchone()
+        if not target_user:
+            raise HTTPException(status_code=404, detail="Пользователь с таким никнеймом не найден")
+        
+        if target_user['id'] == current_user['user_id']:
+            raise HTTPException(status_code=400, detail="Нельзя пригласить самого себя")
+
+        try:
+            cur.execute(
+                "INSERT INTO workspace_members (workspace_id, user_id) VALUES (%s, %s)",
+                (ws['id'], target_user['id'])
+            )
+        except psycopg2.IntegrityError:
+            raise HTTPException(status_code=400, detail="Этот пользователь уже в вашей команде")
+            
+    invite_link = f"https://inv.e-laba52.ru/?team_invite={ws['id']}"
+    return {
+        "status": "ok", 
+        "message": f"Пользователь @{target_user['username']} добавлен!",
+        "invite_link": invite_link
+    }
+
+# --- ЭНДПОИНТЫ СЕРВЕРОВ ---
+@app.post("/api/servers")
+def create_server(server: ServerCreate, current_user: dict = Depends(get_current_user)):
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("SELECT id FROM workspaces WHERE owner_id = %s LIMIT 1", (current_user['user_id'],))
+        ws = cur.fetchone()
+        if not ws:
+            raise HTTPException(status_code=403, detail="У вас нет рабочего пространства")
+        
+        try:
+            cur.execute("""
+                INSERT INTO servers (hostname, ip_address, cluster_id, workspace_id) 
+                VALUES (%s, %s, %s, %s) 
+                RETURNING id, agentgit add app/main.py && git commit -m "feat: handle username invites and validation" && git push origin main
+
+# В папке inv-frontend_token
             """, (server.hostname, server.ip_address, server.cluster_id, ws['id']))
             new_server = cur.fetchone()
         except psycopg2.IntegrityError:
