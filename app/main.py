@@ -1,9 +1,8 @@
 import os
 import json
-import re
 import urllib.request
 import urllib.parse
-from fastapi import FastAPI, Query, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, EmailStr, Field
@@ -75,7 +74,7 @@ class InviteData(BaseModel):
     username: str
     workspace_id: int
 
-# --- АВТОРИЗАЦИЯ ---
+# --- АВТОРИЗАЦИЯ И ПРАВА ---
 def get_current_user(request: Request):
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -91,6 +90,7 @@ def require_global_admin(user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Доступ только для администраторов")
     return user
 
+# Проверка, что юзер просто состоит в группе
 def verify_server_access(cur, server_id: int, user_id: int):
     cur.execute("""
         SELECT s.workspace_id FROM servers s
@@ -99,6 +99,20 @@ def verify_server_access(cur, server_id: int, user_id: int):
     """, (server_id, user_id))
     if not cur.fetchone():
         raise HTTPException(status_code=403, detail="У вас нет доступа к этому серверу")
+
+# Проверка, что юзер - ВЛАДЕЛЕЦ группы, в которой находится сервер (для удаления/переименования/переноса)
+def verify_server_owner(cur, server_id: int, user_id: int):
+    cur.execute("""
+        SELECT w.owner_id FROM servers s
+        JOIN workspaces w ON s.workspace_id = w.id
+        WHERE s.id = %s
+    """, (server_id,))
+    ws = cur.fetchone()
+    if not ws:
+        raise HTTPException(status_code=404, detail="Сервер не найден")
+    if ws['owner_id'] != user_id:
+        raise HTTPException(status_code=403, detail="Только владелец группы может управлять серверами")
+    return ws
 
 # --- ЭНДПОИНТЫ АВТОРИЗАЦИИ ---
 @app.post("/api/login")
@@ -173,10 +187,16 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
                 WHERE workspace_id = %s AND status != 'archived'
                 ORDER BY id ASC
             """, (ws['id'],))
-            ws['servers'] = cur.fetchall()
+            servers = cur.fetchall()
+            
+            # ВАЖНО: Скрываем токен агента от рядовых пользователей группы
+            for s in servers:
+                if not ws['is_owner']:
+                    s['agent_token'] = ""
+            ws['servers'] = servers
             
             cur.execute("""
-                SELECT u.username, u.email 
+                SELECT u.id, u.username, u.email 
                 FROM workspace_members wm
                 JOIN users u ON wm.user_id = u.id
                 WHERE wm.workspace_id = %s
@@ -223,6 +243,21 @@ def leave_workspace(ws_id: int, current_user: dict = Depends(get_current_user)):
         cur.execute("DELETE FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (ws_id, current_user['user_id']))
     return {"status": "ok"}
 
+@app.delete("/api/workspaces/{ws_id}/members/{target_user_id}")
+def remove_member(ws_id: int, target_user_id: int, current_user: dict = Depends(get_current_user)):
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("SELECT owner_id FROM workspaces WHERE id = %s", (ws_id,))
+        ws = cur.fetchone()
+        if not ws:
+            raise HTTPException(status_code=404, detail="Группа не найдена")
+        if ws['owner_id'] != current_user['user_id']:
+            raise HTTPException(status_code=403, detail="Только владелец может удалять пользователей")
+        if ws['owner_id'] == target_user_id:
+            raise HTTPException(status_code=400, detail="Нельзя удалить самого себя (владельца)")
+            
+        cur.execute("DELETE FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (ws_id, target_user_id))
+    return {"status": "ok"}
+
 @app.post("/api/team/invite")
 def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_user)):
     clean_username = data.username.strip('@')
@@ -255,9 +290,11 @@ def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_us
 @app.post("/api/servers")
 def create_server(server: ServerCreate, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        cur.execute("SELECT 1 FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (server.workspace_id, current_user['user_id']))
-        if not cur.fetchone():
-            raise HTTPException(status_code=403, detail="У вас нет доступа к этой группе")
+        # Сервер может добавить только владелец
+        cur.execute("SELECT owner_id FROM workspaces WHERE id = %s", (server.workspace_id,))
+        ws = cur.fetchone()
+        if not ws or ws['owner_id'] != current_user['user_id']:
+            raise HTTPException(status_code=403, detail="Только владелец группы может добавлять серверы")
         
         try:
             cur.execute("""
@@ -278,7 +315,7 @@ def create_server(server: ServerCreate, current_user: dict = Depends(get_current
 @app.put("/api/servers/{server_id}/rename")
 def rename_server(server_id: int, data: ServerRename, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        verify_server_access(cur, server_id, current_user['user_id'])
+        verify_server_owner(cur, server_id, current_user['user_id'])
         try:
             cur.execute("UPDATE servers SET hostname = %s WHERE id = %s", (data.hostname, server_id))
         except psycopg2.IntegrityError:
@@ -288,21 +325,12 @@ def rename_server(server_id: int, data: ServerRename, current_user: dict = Depen
 @app.put("/api/servers/{server_id}/move")
 def move_server(server_id: int, data: ServerMove, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        cur.execute("""
-            SELECT w.owner_id FROM servers s
-            JOIN workspaces w ON s.workspace_id = w.id
-            WHERE s.id = %s
-        """, (server_id,))
-        ws = cur.fetchone()
+        verify_server_owner(cur, server_id, current_user['user_id'])
         
-        if not ws:
-            raise HTTPException(status_code=404, detail="Сервер не найден")
-        if ws['owner_id'] != current_user['user_id']:
-            raise HTTPException(status_code=403, detail="Только создатель группы может перемещать её серверы")
-
-        cur.execute("SELECT 1 FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (data.target_workspace_id, current_user['user_id']))
-        if not cur.fetchone():
-            raise HTTPException(status_code=403, detail="У вас нет доступа к целевой группе")
+        cur.execute("SELECT owner_id FROM workspaces WHERE id = %s", (data.target_workspace_id,))
+        target_ws = cur.fetchone()
+        if not target_ws or target_ws['owner_id'] != current_user['user_id']:
+            raise HTTPException(status_code=403, detail="У вас нет прав владельца в целевой группе")
             
         cur.execute("UPDATE servers SET workspace_id = %s WHERE id = %s", (data.target_workspace_id, server_id))
     return {"status": "ok"}
@@ -310,7 +338,7 @@ def move_server(server_id: int, data: ServerMove, current_user: dict = Depends(g
 @app.delete("/api/servers/{server_id}")
 def archive_server(server_id: int, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        verify_server_access(cur, server_id, current_user['user_id'])
+        verify_server_owner(cur, server_id, current_user['user_id'])
         cur.execute("UPDATE servers SET status = 'archived' WHERE id = %s;", (server_id,))
     return {"status": "ok"}
 
@@ -327,13 +355,11 @@ def get_server_logs(server_id: int, job: str = "varlogs", limit: int = 150, curr
 
     token = str(server['agent_token'])
     
-    # Формируем запрос к Loki (внутренний адрес в Kubernetes)
     query = f'{{job="{job}"}}'
     encoded_query = urllib.parse.quote(query)
     loki_url = f"http://loki-service:3100/loki/api/v1/query?query={encoded_query}&limit={limit}"
     
     req = urllib.request.Request(loki_url)
-    # КЛЮЧЕВОЙ МОМЕНТ: Передаем токен как OrgID, чтобы Loki понял, чьи логи мы просим
     req.add_header("X-Scope-OrgID", token)
     
     try:
@@ -344,15 +370,24 @@ def get_server_logs(server_id: int, job: str = "varlogs", limit: int = 150, curr
                 result = data.get("data", {}).get("result", [])
                 for stream in result:
                     for val in stream.get("values", []):
-                        # val = [timestamp_string, log_line_string]
                         logs.append({"ts": val[0], "line": val[1]})
             
-            # Сортируем логи от старых к новым для правильного отображения в терминале
             logs.sort(key=lambda x: x["ts"])
             return {"status": "ok", "logs": logs}
     except Exception as e:
-        print(f"Loki fetch error: {e}")
-        return {"status": "error", "logs": [], "detail": "Логи временно недоступны или еще не поступили"}
+        return {"status": "error", "logs": [], "detail": "Логи временно недоступны"}
+
+# --- АДМИН ПАНЕЛЬ ---
+@app.get("/api/admin/users")
+def get_all_users(current_user: dict = Depends(require_global_admin)):
+    with get_db_cursor() as cur:
+        cur.execute("""
+            SELECT u.id, u.username, u.email, r.role_name
+            FROM users u
+            JOIN roles r ON u.role_id = r.id
+            ORDER BY u.id ASC
+        """)
+        return cur.fetchall()
 
 @app.get("/api/export")
 def export_database(current_user: dict = Depends(require_global_admin)):
