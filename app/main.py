@@ -209,6 +209,21 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
 @app.post("/api/workspaces")
 def create_workspace(data: WorkspaceCreate, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
+        # ЗАЩИТА 1: Лимит на количество групп В ДЕНЬ (как ты и просил)
+        cur.execute("""
+            SELECT COUNT(*) as cnt 
+            FROM workspaces 
+            WHERE owner_id = %s AND created_at >= CURRENT_DATE
+        """, (current_user['user_id'],))
+        
+        if cur.fetchone()['cnt'] >= 10:
+            raise HTTPException(status_code=400, detail="Лимит исчерпан: не более 10 новых групп в день. Попробуйте завтра.")
+            
+        # ЗАЩИТА 2: Проверка на дубликаты имен
+        cur.execute("SELECT 1 FROM workspaces WHERE name = %s AND owner_id = %s", (data.name, current_user['user_id']))
+        if cur.fetchone():
+            raise HTTPException(status_code=400, detail="Группа с таким названием уже существует")
+
         cur.execute("INSERT INTO workspaces (name, owner_id) VALUES (%s, %s) RETURNING id", (data.name, current_user['user_id']))
         ws_id = cur.fetchone()['id']
         cur.execute("INSERT INTO workspace_members (workspace_id, user_id) VALUES (%s, %s)", (ws_id, current_user['user_id']))
