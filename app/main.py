@@ -90,6 +90,7 @@ def require_global_admin(user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Доступ только для администраторов")
     return user
 
+# Проверка: состоит ли юзер в группе сервера
 def verify_server_access(cur, server_id: int, user_id: int):
     cur.execute("""
         SELECT s.workspace_id FROM servers s
@@ -99,6 +100,7 @@ def verify_server_access(cur, server_id: int, user_id: int):
     if not cur.fetchone():
         raise HTTPException(status_code=403, detail="У вас нет доступа к этому серверу")
 
+# Проверка: владеет ли юзер группой, в которой сейчас находится сервер
 def verify_server_owner(cur, server_id: int, user_id: int):
     cur.execute("""
         SELECT w.owner_id FROM servers s
@@ -180,7 +182,7 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
             ws['is_owner'] = (ws['owner_id'] == current_user['user_id'])
             
             cur.execute("""
-                SELECT id, hostname, ip_address, status, agent_token 
+                SELECT id, hostname, ip_address, status, agent_token, creator_id 
                 FROM servers 
                 WHERE workspace_id = %s AND status != 'archived'
                 ORDER BY id ASC
@@ -188,8 +190,13 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
             servers = cur.fetchall()
             
             for s in servers:
-                if not ws['is_owner']:
+                # Метка для фронтенда: является ли этот юзер ИЗНАЧАЛЬНЫМ создателем сервера
+                s['is_creator'] = (s.get('creator_id') == current_user['user_id'])
+                
+                # Скрываем токен агента от всех, кроме создателя
+                if not s['is_creator']:
                     s['agent_token'] = ""
+            
             ws['servers'] = servers
             
             cur.execute("""
@@ -206,14 +213,17 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
 @app.post("/api/workspaces")
 def create_workspace(data: WorkspaceCreate, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
+        # ЗАЩИТА 1: Лимит на количество групп В ДЕНЬ
         cur.execute("""
             SELECT COUNT(*) as cnt 
             FROM workspaces 
             WHERE owner_id = %s AND created_at >= CURRENT_DATE
         """, (current_user['user_id'],))
+        
         if cur.fetchone()['cnt'] >= 10:
             raise HTTPException(status_code=400, detail="Лимит исчерпан: не более 10 новых групп в день. Попробуйте завтра.")
             
+        # ЗАЩИТА 2: Проверка на дубликаты
         cur.execute("SELECT 1 FROM workspaces WHERE name = %s AND owner_id = %s", (data.name, current_user['user_id']))
         if cur.fetchone():
             raise HTTPException(status_code=400, detail="Группа с таким названием уже существует")
@@ -269,9 +279,7 @@ def remove_member(ws_id: int, target_user_id: int, current_user: dict = Depends(
 
 @app.post("/api/team/invite")
 def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_user)):
-    # Убираем пробелы и @ если пользователь случайно ввел их
     clean_username = data.username.replace('@', '').strip()
-    
     with get_db_cursor(commit=True) as cur:
         cur.execute("SELECT owner_id FROM workspaces WHERE id = %s", (data.workspace_id,))
         ws = cur.fetchone()
@@ -280,20 +288,17 @@ def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_us
 
         cur.execute("SELECT id, username FROM users WHERE username = %s", (clean_username,))
         target_user = cur.fetchone()
-        
-        # Ошибка 1: Пользователя вообще не существует
         if not target_user:
-            raise HTTPException(status_code=404, detail=f"Пользователь @{clean_username} не найден в системе. Проверьте правильность никнейма.")
+            raise HTTPException(status_code=404, detail=f"Пользователь @{clean_username} не найден. Проверьте никнейм.")
         
         if target_user['id'] == current_user['user_id']:
-            raise HTTPException(status_code=400, detail="Вы не можете добавить самого себя")
+            raise HTTPException(status_code=400, detail="Нельзя пригласить самого себя")
 
-        # Ошибка 2: Пользователь уже в группе
+        # Точная и понятная ошибка при дублировании
         cur.execute("SELECT 1 FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (data.workspace_id, target_user['id']))
         if cur.fetchone():
             raise HTTPException(status_code=400, detail=f"Пользователь @{target_user['username']} уже состоит в этой группе")
 
-        # Добавляем в группу
         cur.execute("INSERT INTO workspace_members (workspace_id, user_id) VALUES (%s, %s)", (data.workspace_id, target_user['id']))
             
     return {
@@ -313,17 +318,18 @@ def create_server(server: ServerCreate, current_user: dict = Depends(get_current
         
         try:
             cur.execute("""
-                INSERT INTO servers (hostname, ip_address, cluster_id, workspace_id) 
-                VALUES (%s, %s, %s, %s) 
+                INSERT INTO servers (hostname, ip_address, cluster_id, workspace_id, creator_id) 
+                VALUES (%s, %s, %s, %s, %s) 
                 RETURNING id, agent_token
-            """, (server.hostname, server.ip_address, server.cluster_id, server.workspace_id))
+            """, (server.hostname, server.ip_address, server.cluster_id, server.workspace_id, current_user['user_id']))
             new_server = cur.fetchone()
         except psycopg2.IntegrityError:
             raise HTTPException(status_code=400, detail="Сервер с таким именем уже есть в этой группе")
             
     return {
         "status": "ok", 
-        "agent_token": new_server['agent_token']
+        "agent_token": new_server['agent_token'],
+        "install_command": f"curl -sL https://inv.e-laba52.ru/agent.sh | sudo bash -s -- --token={new_server['agent_token']}"
     }
 
 @app.put("/api/servers/{server_id}/rename")
@@ -339,12 +345,13 @@ def rename_server(server_id: int, data: ServerRename, current_user: dict = Depen
 @app.put("/api/servers/{server_id}/move")
 def move_server(server_id: int, data: ServerMove, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
+        # Убеждаемся, что мы владелец группы, ИЗ КОТОРОЙ переносим
         verify_server_owner(cur, server_id, current_user['user_id'])
         
-        # Пользователь должен просто СОСТОЯТЬ в целевой группе (быть участником или владельцем)
+        # Разрешаем перенос в любую группу, ГДЕ МЫ ХОТЯ БЫ УЧАСТНИК
         cur.execute("SELECT 1 FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (data.target_workspace_id, current_user['user_id']))
         if not cur.fetchone():
-            raise HTTPException(status_code=403, detail="У вас нет доступа к целевой группе")
+            raise HTTPException(status_code=403, detail="Вы не состоите в целевой группе")
             
         cur.execute("UPDATE servers SET workspace_id = %s WHERE id = %s", (data.target_workspace_id, server_id))
     return {"status": "ok"}
