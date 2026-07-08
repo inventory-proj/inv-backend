@@ -64,7 +64,6 @@ class ServerCreate(BaseModel):
     workspace_id: int
     cluster_id: int | None = None
 
-# Добавили прием флагов делегирования
 class ServerMove(BaseModel):
     target_workspace_id: int
     delegated_can_delete: bool = False
@@ -103,7 +102,7 @@ def verify_server_access(cur, server_id: int, user_id: int):
     if not cur.fetchone():
         raise HTTPException(status_code=403, detail="У вас нет доступа к этому серверу")
 
-# УНИВЕРСАЛЬНАЯ ЗАЩИТА СЕРВЕРОВ (RBAC)
+# УНИВЕРСАЛЬНАЯ ЗАЩИТА СЕРВЕРОВ (RBAC) - с жесткой типизацией
 def check_server_permissions(cur, server_id: int, user_id: int, required_action: str):
     cur.execute("""
         SELECT s.workspace_id, s.creator_id, s.delegated_can_delete, 
@@ -116,27 +115,25 @@ def check_server_permissions(cur, server_id: int, user_id: int, required_action:
     if not server:
         raise HTTPException(status_code=404, detail="Сервер не найден")
         
-    is_creator = (server['creator_id'] == user_id)
-    is_owner = (server['owner_id'] == user_id)
+    # Жесткое приведение типов к строкам для исключения багов
+    is_creator = (str(server.get('creator_id')) == str(user_id))
+    is_owner = (str(server.get('owner_id')) == str(user_id))
     
-    # 1. Создателю сервера разрешено абсолютно всё
     if is_creator:
         return True
         
-    # 2. Если ты не создатель и не владелец группы - тебе вообще ничего нельзя
     if not is_owner:
-        raise HTTPException(status_code=403, detail="Вы не являетесь владельцем группы")
+        raise HTTPException(status_code=403, detail="Только владелец группы может управлять сервером")
         
-    # 3. Владелец группы может выкинуть чужой сервер (перенести)
     if required_action == 'move':
         return True
         
-    # 4. Проверяем делегированные права от создателя
-    if required_action == 'delete' and not server['delegated_can_delete']:
+    # Проверка выданных прав
+    if required_action == 'delete' and not bool(server.get('delegated_can_delete')):
         raise HTTPException(status_code=403, detail="Создатель запретил удалять этот сервер")
-    elif required_action == 'rename' and not server['delegated_can_rename']:
+    elif required_action == 'rename' and not bool(server.get('delegated_can_rename')):
         raise HTTPException(status_code=403, detail="Создатель запретил переименовывать этот сервер")
-    elif required_action == 'view_agent' and not server['delegated_can_view_agent']:
+    elif required_action == 'view_agent' and not bool(server.get('delegated_can_view_agent')):
         raise HTTPException(status_code=403, detail="Создатель скрыл токен агента")
         
     return True
@@ -205,8 +202,10 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
         """, (current_user['user_id'],))
         workspaces = cur.fetchall()
 
-        for ws in workspaces:
-            ws['is_owner'] = (ws['owner_id'] == current_user['user_id'])
+        result_workspaces = []
+        for row_ws in workspaces:
+            ws = dict(row_ws) # Очищаем от RealDictRow
+            ws['is_owner'] = (str(ws['owner_id']) == str(current_user['user_id']))
             
             cur.execute("""
                 SELECT id, hostname, ip_address, status, agent_token, creator_id,
@@ -217,19 +216,25 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
             """, (ws['id'],))
             servers = cur.fetchall()
             
-            for s in servers:
-                s['is_creator'] = (s.get('creator_id') == current_user['user_id'])
+            processed_servers = []
+            for row_s in servers:
+                s = dict(row_s)
                 
-                # Рассчитываем права для фронтенда
-                s['can_delete'] = s['is_creator'] or (ws['is_owner'] and s.get('delegated_can_delete', False))
-                s['can_rename'] = s['is_creator'] or (ws['is_owner'] and s.get('delegated_can_rename', False))
-                s['can_view_agent'] = s['is_creator'] or (ws['is_owner'] and s.get('delegated_can_view_agent', False))
+                # Жесткое сравнение строк для предотвращения бага типизации
+                is_creator = (str(s.get('creator_id')) == str(current_user['user_id']))
+                s['is_creator'] = is_creator
                 
-                # Скрываем токен, если нет прав
+                # Расчет прав доступа
+                s['can_delete'] = is_creator or (ws['is_owner'] and bool(s.get('delegated_can_delete')))
+                s['can_rename'] = is_creator or (ws['is_owner'] and bool(s.get('delegated_can_rename')))
+                s['can_view_agent'] = is_creator or (ws['is_owner'] and bool(s.get('delegated_can_view_agent')))
+                
                 if not s['can_view_agent']:
                     s['agent_token'] = ""
+                    
+                processed_servers.append(s)
             
-            ws['servers'] = servers
+            ws['servers'] = processed_servers
             
             cur.execute("""
                 SELECT u.id, u.username, u.email 
@@ -237,9 +242,11 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
                 JOIN users u ON wm.user_id = u.id
                 WHERE wm.workspace_id = %s
             """, (ws['id'],))
-            ws['members'] = cur.fetchall()
+            ws['members'] = [dict(m) for m in cur.fetchall()]
+            
+            result_workspaces.append(ws)
 
-        return workspaces
+        return result_workspaces
 
 # --- WORKSPACES И ИНВАЙТЫ ---
 @app.post("/api/workspaces")
@@ -313,7 +320,7 @@ def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_us
     with get_db_cursor(commit=True) as cur:
         cur.execute("SELECT owner_id FROM workspaces WHERE id = %s", (data.workspace_id,))
         ws = cur.fetchone()
-        if not ws or ws['owner_id'] != current_user['user_id']:
+        if not ws or str(ws['owner_id']) != str(current_user['user_id']):
             raise HTTPException(status_code=403, detail="Только создатель группы может приглашать участников")
 
         cur.execute("SELECT id, username FROM users WHERE username = %s", (clean_username,))
@@ -322,7 +329,7 @@ def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_us
         if not target_user:
             raise HTTPException(status_code=404, detail=f"Пользователь @{clean_username} не найден в системе. Проверьте правильность никнейма.")
         
-        if target_user['id'] == current_user['user_id']:
+        if str(target_user['id']) == str(current_user['user_id']):
             raise HTTPException(status_code=400, detail="Вы не можете добавить самого себя")
 
         cur.execute("SELECT 1 FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (data.workspace_id, target_user['id']))
@@ -343,7 +350,7 @@ def create_server(server: ServerCreate, current_user: dict = Depends(get_current
     with get_db_cursor(commit=True) as cur:
         cur.execute("SELECT owner_id FROM workspaces WHERE id = %s", (server.workspace_id,))
         ws = cur.fetchone()
-        if not ws or ws['owner_id'] != current_user['user_id']:
+        if not ws or str(ws['owner_id']) != str(current_user['user_id']):
             raise HTTPException(status_code=403, detail="Только владелец группы может добавлять серверы")
         
         try:
@@ -375,22 +382,20 @@ def rename_server(server_id: int, data: ServerRename, current_user: dict = Depen
 @app.put("/api/servers/{server_id}/move")
 def move_server(server_id: int, data: ServerMove, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        # Проверяем, есть ли у нас права на перенос (Владелец группы или Создатель)
         check_server_permissions(cur, server_id, current_user['user_id'], 'move')
         
         cur.execute("SELECT creator_id FROM servers WHERE id = %s", (server_id,))
-        is_creator = (cur.fetchone()['creator_id'] == current_user['user_id'])
+        server_data = cur.fetchone()
+        is_creator = (str(server_data.get('creator_id')) == str(current_user['user_id']))
         
-        # Проверяем доступ к целевой группе (можно переносить куда угодно, где ты состоишь)
         cur.execute("SELECT 1 FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (data.target_workspace_id, current_user['user_id']))
         if not cur.fetchone():
             raise HTTPException(status_code=403, detail="Вы не состоите в целевой группе")
             
-        # Защита от эскалации привилегий: только Создатель может раздавать права.
-        # Если переносит не создатель - права сбрасываются (или остаются ложными).
-        del_del = data.delegated_can_delete if is_creator else False
-        del_ren = data.delegated_can_rename if is_creator else False
-        del_agt = data.delegated_can_view_agent if is_creator else False
+        # Галочки передаются только если перенос делает изначальный создатель
+        del_del = bool(data.delegated_can_delete) if is_creator else False
+        del_ren = bool(data.delegated_can_rename) if is_creator else False
+        del_agt = bool(data.delegated_can_view_agent) if is_creator else False
             
         cur.execute("""
             UPDATE servers 
@@ -409,7 +414,7 @@ def archive_server(server_id: int, current_user: dict = Depends(get_current_user
         cur.execute("UPDATE servers SET status = 'archived' WHERE id = %s;", (server_id,))
     return {"status": "ok"}
 
-# --- ЭНДПОИНТ ДЛЯ ПОЛУЧЕНИЯ ЛОГОВ (ПРОКСИ В LOKI) ---
+# --- ЭНДПОИНТ ДЛЯ ПОЛУЧЕНИЯ ЛОГОВ ---
 @app.get("/api/servers/{server_id}/logs")
 def get_server_logs(server_id: int, job: str = "varlogs", limit: int = 150, current_user: dict = Depends(get_current_user)):
     with get_db_cursor() as cur:
@@ -421,7 +426,6 @@ def get_server_logs(server_id: int, job: str = "varlogs", limit: int = 150, curr
         raise HTTPException(status_code=404, detail="Агент не инициализирован")
 
     token = str(server['agent_token'])
-    
     query = f'{{job="{job}"}}'
     encoded_query = urllib.parse.quote(query)
     loki_url = f"http://loki-service:3100/loki/api/v1/query?query={encoded_query}&limit={limit}"
