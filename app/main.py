@@ -64,8 +64,12 @@ class ServerCreate(BaseModel):
     workspace_id: int
     cluster_id: int | None = None
 
+# Добавили прием флагов делегирования
 class ServerMove(BaseModel):
     target_workspace_id: int
+    delegated_can_delete: bool = False
+    delegated_can_rename: bool = False
+    delegated_can_view_agent: bool = False
 
 class ServerRename(BaseModel):
     hostname: str
@@ -90,7 +94,6 @@ def require_global_admin(user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Доступ только для администраторов")
     return user
 
-# Проверка: состоит ли юзер в группе сервера
 def verify_server_access(cur, server_id: int, user_id: int):
     cur.execute("""
         SELECT s.workspace_id FROM servers s
@@ -100,19 +103,43 @@ def verify_server_access(cur, server_id: int, user_id: int):
     if not cur.fetchone():
         raise HTTPException(status_code=403, detail="У вас нет доступа к этому серверу")
 
-# Проверка: владеет ли юзер группой, в которой сейчас находится сервер
-def verify_server_owner(cur, server_id: int, user_id: int):
+# УНИВЕРСАЛЬНАЯ ЗАЩИТА СЕРВЕРОВ (RBAC)
+def check_server_permissions(cur, server_id: int, user_id: int, required_action: str):
     cur.execute("""
-        SELECT w.owner_id FROM servers s
+        SELECT s.workspace_id, s.creator_id, s.delegated_can_delete, 
+               s.delegated_can_rename, s.delegated_can_view_agent, w.owner_id
+        FROM servers s
         JOIN workspaces w ON s.workspace_id = w.id
         WHERE s.id = %s
     """, (server_id,))
-    ws = cur.fetchone()
-    if not ws:
+    server = cur.fetchone()
+    if not server:
         raise HTTPException(status_code=404, detail="Сервер не найден")
-    if ws['owner_id'] != user_id:
-        raise HTTPException(status_code=403, detail="Только владелец группы может управлять серверами")
-    return ws
+        
+    is_creator = (server['creator_id'] == user_id)
+    is_owner = (server['owner_id'] == user_id)
+    
+    # 1. Создателю сервера разрешено абсолютно всё
+    if is_creator:
+        return True
+        
+    # 2. Если ты не создатель и не владелец группы - тебе вообще ничего нельзя
+    if not is_owner:
+        raise HTTPException(status_code=403, detail="Вы не являетесь владельцем группы")
+        
+    # 3. Владелец группы может выкинуть чужой сервер (перенести)
+    if required_action == 'move':
+        return True
+        
+    # 4. Проверяем делегированные права от создателя
+    if required_action == 'delete' and not server['delegated_can_delete']:
+        raise HTTPException(status_code=403, detail="Создатель запретил удалять этот сервер")
+    elif required_action == 'rename' and not server['delegated_can_rename']:
+        raise HTTPException(status_code=403, detail="Создатель запретил переименовывать этот сервер")
+    elif required_action == 'view_agent' and not server['delegated_can_view_agent']:
+        raise HTTPException(status_code=403, detail="Создатель скрыл токен агента")
+        
+    return True
 
 # --- ЭНДПОИНТЫ АВТОРИЗАЦИИ ---
 @app.post("/api/login")
@@ -182,7 +209,8 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
             ws['is_owner'] = (ws['owner_id'] == current_user['user_id'])
             
             cur.execute("""
-                SELECT id, hostname, ip_address, status, agent_token, creator_id 
+                SELECT id, hostname, ip_address, status, agent_token, creator_id,
+                       delegated_can_delete, delegated_can_rename, delegated_can_view_agent
                 FROM servers 
                 WHERE workspace_id = %s AND status != 'archived'
                 ORDER BY id ASC
@@ -190,11 +218,15 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
             servers = cur.fetchall()
             
             for s in servers:
-                # Метка для фронтенда: является ли этот юзер ИЗНАЧАЛЬНЫМ создателем сервера
                 s['is_creator'] = (s.get('creator_id') == current_user['user_id'])
                 
-                # Скрываем токен агента от всех, кроме создателя
-                if not s['is_creator']:
+                # Рассчитываем права для фронтенда
+                s['can_delete'] = s['is_creator'] or (ws['is_owner'] and s.get('delegated_can_delete', False))
+                s['can_rename'] = s['is_creator'] or (ws['is_owner'] and s.get('delegated_can_rename', False))
+                s['can_view_agent'] = s['is_creator'] or (ws['is_owner'] and s.get('delegated_can_view_agent', False))
+                
+                # Скрываем токен, если нет прав
+                if not s['can_view_agent']:
                     s['agent_token'] = ""
             
             ws['servers'] = servers
@@ -213,7 +245,6 @@ def get_dashboard(current_user: dict = Depends(get_current_user)):
 @app.post("/api/workspaces")
 def create_workspace(data: WorkspaceCreate, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        # ЗАЩИТА 1: Лимит на количество групп В ДЕНЬ
         cur.execute("""
             SELECT COUNT(*) as cnt 
             FROM workspaces 
@@ -223,7 +254,6 @@ def create_workspace(data: WorkspaceCreate, current_user: dict = Depends(get_cur
         if cur.fetchone()['cnt'] >= 10:
             raise HTTPException(status_code=400, detail="Лимит исчерпан: не более 10 новых групп в день. Попробуйте завтра.")
             
-        # ЗАЩИТА 2: Проверка на дубликаты
         cur.execute("SELECT 1 FROM workspaces WHERE name = %s AND owner_id = %s", (data.name, current_user['user_id']))
         if cur.fetchone():
             raise HTTPException(status_code=400, detail="Группа с таким названием уже существует")
@@ -288,13 +318,13 @@ def invite_to_team(data: InviteData, current_user: dict = Depends(get_current_us
 
         cur.execute("SELECT id, username FROM users WHERE username = %s", (clean_username,))
         target_user = cur.fetchone()
+        
         if not target_user:
-            raise HTTPException(status_code=404, detail=f"Пользователь @{clean_username} не найден. Проверьте никнейм.")
+            raise HTTPException(status_code=404, detail=f"Пользователь @{clean_username} не найден в системе. Проверьте правильность никнейма.")
         
         if target_user['id'] == current_user['user_id']:
-            raise HTTPException(status_code=400, detail="Нельзя пригласить самого себя")
+            raise HTTPException(status_code=400, detail="Вы не можете добавить самого себя")
 
-        # Точная и понятная ошибка при дублировании
         cur.execute("SELECT 1 FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (data.workspace_id, target_user['id']))
         if cur.fetchone():
             raise HTTPException(status_code=400, detail=f"Пользователь @{target_user['username']} уже состоит в этой группе")
@@ -335,7 +365,7 @@ def create_server(server: ServerCreate, current_user: dict = Depends(get_current
 @app.put("/api/servers/{server_id}/rename")
 def rename_server(server_id: int, data: ServerRename, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        verify_server_owner(cur, server_id, current_user['user_id'])
+        check_server_permissions(cur, server_id, current_user['user_id'], 'rename')
         try:
             cur.execute("UPDATE servers SET hostname = %s WHERE id = %s", (data.hostname, server_id))
         except psycopg2.IntegrityError:
@@ -345,21 +375,37 @@ def rename_server(server_id: int, data: ServerRename, current_user: dict = Depen
 @app.put("/api/servers/{server_id}/move")
 def move_server(server_id: int, data: ServerMove, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        # Убеждаемся, что мы владелец группы, ИЗ КОТОРОЙ переносим
-        verify_server_owner(cur, server_id, current_user['user_id'])
+        # Проверяем, есть ли у нас права на перенос (Владелец группы или Создатель)
+        check_server_permissions(cur, server_id, current_user['user_id'], 'move')
         
-        # Разрешаем перенос в любую группу, ГДЕ МЫ ХОТЯ БЫ УЧАСТНИК
+        cur.execute("SELECT creator_id FROM servers WHERE id = %s", (server_id,))
+        is_creator = (cur.fetchone()['creator_id'] == current_user['user_id'])
+        
+        # Проверяем доступ к целевой группе (можно переносить куда угодно, где ты состоишь)
         cur.execute("SELECT 1 FROM workspace_members WHERE workspace_id = %s AND user_id = %s", (data.target_workspace_id, current_user['user_id']))
         if not cur.fetchone():
             raise HTTPException(status_code=403, detail="Вы не состоите в целевой группе")
             
-        cur.execute("UPDATE servers SET workspace_id = %s WHERE id = %s", (data.target_workspace_id, server_id))
+        # Защита от эскалации привилегий: только Создатель может раздавать права.
+        # Если переносит не создатель - права сбрасываются (или остаются ложными).
+        del_del = data.delegated_can_delete if is_creator else False
+        del_ren = data.delegated_can_rename if is_creator else False
+        del_agt = data.delegated_can_view_agent if is_creator else False
+            
+        cur.execute("""
+            UPDATE servers 
+            SET workspace_id = %s, 
+                delegated_can_delete = %s, 
+                delegated_can_rename = %s, 
+                delegated_can_view_agent = %s 
+            WHERE id = %s
+        """, (data.target_workspace_id, del_del, del_ren, del_agt, server_id))
     return {"status": "ok"}
 
 @app.delete("/api/servers/{server_id}")
 def archive_server(server_id: int, current_user: dict = Depends(get_current_user)):
     with get_db_cursor(commit=True) as cur:
-        verify_server_owner(cur, server_id, current_user['user_id'])
+        check_server_permissions(cur, server_id, current_user['user_id'], 'delete')
         cur.execute("UPDATE servers SET status = 'archived' WHERE id = %s;", (server_id,))
     return {"status": "ok"}
 
