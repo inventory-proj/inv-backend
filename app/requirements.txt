@@ -1,8 +1,8 @@
-fastapi
-uvicorn
-psycopg2-binary
-pydantic
-email-validator
-passlib
-bcrypt==3.2.2
-PyJWT
+fastapi==0.104.1
+uvicorn==0.24.0.post1
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+pydantic==2.5.2
+pydantic[email]==2.5.2
+passlib[bcrypt]==1.7.4
+PyJWT==2.8.0
